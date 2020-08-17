@@ -14,7 +14,6 @@ extern crate bit_vec;
 extern crate rand;
 extern crate siphasher;
 
-use bit_vec::BitVec;
 use rand::prelude::*;
 use siphasher::sip::SipHasher13;
 use std::cmp;
@@ -27,7 +26,7 @@ use rand::Rng;
 
 /// Bloom filter structure
 pub struct Bloom<T: ?Sized> {
-    bitmap: BitVec,
+    bitmap: Vec<u8>,
     bitmap_bits: u64,
     k_num: u32,
     sips: [SipHasher13; 2],
@@ -43,7 +42,7 @@ impl<T: ?Sized> Bloom<T> {
         assert!(bitmap_size > 0 && items_count > 0);
         let bitmap_bits = (bitmap_size as u64) * 8u64;
         let k_num = Self::optimal_k_num(bitmap_bits, items_count);
-        let bitmap = BitVec::from_elem(bitmap_bits as usize, false);
+        let bitmap = vec![0; bitmap_bits as usize];
         let sips = [Self::sip_new(), Self::sip_new()];
         Self {
             bitmap,
@@ -60,27 +59,6 @@ impl<T: ?Sized> Bloom<T> {
     pub fn new_for_fp_rate(items_count: usize, fp_p: f64) -> Self {
         let bitmap_size = Self::compute_bitmap_size(items_count, fp_p);
         Bloom::new(bitmap_size, items_count)
-    }
-
-    /// Create a bloom filter structure with an existing state.
-    /// The state is assumed to be retrieved from an existing bloom filter.
-    pub fn from_existing(
-        bitmap: &[u8],
-        bitmap_bits: u64,
-        k_num: u32,
-        sip_keys: [(u64, u64); 2],
-    ) -> Self {
-        let sips = [
-            SipHasher13::new_with_keys(sip_keys[0].0, sip_keys[0].1),
-            SipHasher13::new_with_keys(sip_keys[1].0, sip_keys[1].1),
-        ];
-        Self {
-            bitmap: BitVec::from_bytes(bitmap),
-            bitmap_bits,
-            k_num,
-            sips,
-            _phantom: PhantomData,
-        }
     }
 
     /// Compute a recommended bitmap size for items_count items
@@ -102,7 +80,21 @@ impl<T: ?Sized> Bloom<T> {
         let mut hashes = [0u64, 0u64];
         for k_i in 0..self.k_num {
             let bit_offset = (self.bloom_hash(&mut hashes, &item, k_i) % self.bitmap_bits) as usize;
-            self.bitmap.set(bit_offset, true);
+            self.bitmap[bit_offset] += 1;
+        }
+    }
+
+    /// Remove item from the bloom filter.
+    pub fn remove(&mut self, item: &T)
+    where
+        T: Hash,
+    {
+        let mut hashes = [0u64, 0u64];
+        for k_i in 0..self.k_num {
+            let bit_offset = (self.bloom_hash(&mut hashes, &item, k_i) % self.bitmap_bits) as usize;
+            if self.bitmap[bit_offset] > 0 {
+                self.bitmap[bit_offset] -= 1;
+            }
         }
     }
 
@@ -115,7 +107,7 @@ impl<T: ?Sized> Bloom<T> {
         let mut hashes = [0u64, 0u64];
         for k_i in 0..self.k_num {
             let bit_offset = (self.bloom_hash(&mut hashes, &item, k_i) % self.bitmap_bits) as usize;
-            if self.bitmap.get(bit_offset).unwrap() == false {
+            if self.bitmap[bit_offset] == 0 {
                 return false;
             }
         }
@@ -132,17 +124,12 @@ impl<T: ?Sized> Bloom<T> {
         let mut found = true;
         for k_i in 0..self.k_num {
             let bit_offset = (self.bloom_hash(&mut hashes, &item, k_i) % self.bitmap_bits) as usize;
-            if self.bitmap.get(bit_offset).unwrap() == false {
+            if self.bitmap[bit_offset] == 0 {
                 found = false;
-                self.bitmap.set(bit_offset, true);
+                self.bitmap[bit_offset] += 1;
             }
         }
         found
-    }
-
-    /// Return the bitmap as a vector of bytes
-    pub fn bitmap(&self) -> Vec<u8> {
-        self.bitmap.to_bytes()
     }
 
     /// Return the number of bits in the filter
@@ -185,7 +172,9 @@ impl<T: ?Sized> Bloom<T> {
 
     /// Clear all of the bits in the filter, removing all keys from the set
     pub fn clear(&mut self) {
-        self.bitmap.clear()
+        for elem in &mut self.bitmap {
+            *elem = 0;
+        }
     }
 
     fn sip_new() -> SipHasher13 {
@@ -228,19 +217,13 @@ fn bloom_test_clear() {
 }
 
 #[test]
-fn bloom_test_load() {
+fn bloom_test_remove() {
     let mut rng = thread_rng();
-    let mut original = Bloom::new(10, 80);
+    let mut bloom = Bloom::new(10, 80);
     let mut key = vec![0u8, 16];
     rng.fill_bytes(&mut key);
-    original.set(&key);
-    assert!(original.check(&key) == true);
-
-    let cloned = Bloom::from_existing(
-        &original.bitmap(),
-        original.number_of_bits(),
-        original.number_of_hash_functions(),
-        original.sip_keys(),
-    );
-    assert!(cloned.check(&key) == true);
+    bloom.set(&key);
+    assert!(bloom.check(&key) == true);
+    bloom.remove(&key);
+    assert!(bloom.check(&key) == false);
 }
